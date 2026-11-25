@@ -25,7 +25,15 @@ private struct EventEmission: Sendable {
 /// lives for the whole process.
 public final class Encatch: @unchecked Sendable {
     public static let shared = Encatch()
-    private init() {}
+    /// Internal (not private) so tests can use a fresh instance each; apps use `shared`.
+    init() {}
+
+    // Test seams (internal; set before `initialize`): the HTTP exchange and the storage suite.
+    var transportForTesting: HttpTransport?
+    var storageDefaultsForTesting: UserDefaults?
+    var loggerForTesting: EncatchLogger?
+    /// Ping interval, collapse window, backoff, timeout and pause lengths (tests shorten them).
+    var timings = EncatchTimings()
 
     // Initialisation state
     private var initialized = false
@@ -38,10 +46,41 @@ public final class Encatch: @unchecked Sendable {
     private var isFullScreenState = false
     private var onBeforeShowForm: BeforeShowFormInterceptor?
 
-    // Identity
+    // Identity — read and written under [stateLock], so a request never pairs a name with another
+    // user's id or signature.
     private var userNameState: String?
     private var userIdState: String?
+    /// The signature of the current user's last successful secure identify, and its time.
     private var userSignature: String?
+    private var userSignatureTime: String?
+    /// The stored session-time signature expired (a 401): until the next successful identify,
+    /// background calls are skipped and survey submits are held (RN 1.4.4 item 16).
+    private var signatureExpired = false
+    /// A confirmed identity (RN 1.5.0 item 2): the user was restored at init with their id, or their
+    /// identify succeeded. Kept through a user switch until the new user's identify succeeds;
+    /// cleared by resetUser() (also the server's "retries exhausted" reset) and clearAll().
+    private var confirmedIdentity = false
+    /// The user's data for this app run when `persistUserAcrossRestarts` is off; kept across a re-init.
+    private let memoryUserStore = MemoryUserStore()
+    private var heldSubmits: [SubmitFormRequest] = []
+    static let maxHeldSubmits = 10
+    /// The last identify sent or in flight (dedupe); cleared when it is dropped, on reset, clearAll.
+    private var lastIdentifyKey: String?
+    private let stateLock = NSLock()
+
+    private func withStateLock<T>(_ body: () -> T) -> T {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return body()
+    }
+
+    /// identifyUser and resetUser run one after the other, in call order (RN 1.4.4 item 13).
+    private let identityOps = SerialOps()
+
+    /// Collapse (RN 1.4.4 item 4), under [stateLock]: when each event name was last sent, and the
+    /// last screen tracked. Monotonic ms.
+    private var lastEventAtMs: [String: Int64] = [:]
+    private var lastScreen: (name: String, atMs: Int64)?
 
     // Preferences
     private var localeState: String?
@@ -61,6 +100,22 @@ public final class Encatch: @unchecked Sendable {
     // Form visibility (suppresses ping)
     private var isFormVisible = false
 
+    // One survey at a time (mirrors RN 1.4.4 `_scheduleAutoShow`, the Kotlin `Encatch`): the automatic
+    // show waiting out its `onPageDelay`, the form whose show-form is in flight, and the open survey
+    // by both its names. Read and written under [surveyLock].
+    private var pendingAutoShow: Task<Void, Never>?
+    /// Which scheduled show [pendingAutoShow] is: a cancelled older one must not clear a newer one's handle.
+    private var pendingAutoShowToken: UUID?
+    private var loadingFormId: String?
+    private var openFormIds: Set<String> = []
+    private let surveyLock = NSLock()
+
+    private func withSurveyLock<T>(_ body: () -> T) -> T {
+        surveyLock.lock()
+        defer { surveyLock.unlock() }
+        return body()
+    }
+
     // Session control
     private var isSessionPaused = false
     private var isSessionStopped = false
@@ -79,6 +134,7 @@ public final class Encatch: @unchecked Sendable {
     private var apiClient: EncatchApiClient!
     private var retryQueue: RetryQueue!
     private var sessionManager: SessionManager!
+    private var rateLimiter: RateLimiter!
     private var logger: EncatchLogger = DefaultEncatchLogger(debugMode: { false })
 
     // Tracks the retry-queue flush kicked off at the end of the most recent `initialize()`, and
@@ -110,7 +166,7 @@ public final class Encatch: @unchecked Sendable {
         await pendingReinitTask?.value
 
         debugModeState = config?.debugMode ?? false
-        logger = DefaultEncatchLogger(debugMode: { [self] in debugModeState })
+        logger = loggerForTesting ?? DefaultEncatchLogger(debugMode: { [self] in debugModeState })
 
         if initialized {
             // Reconfigure rather than no-op: a host app (or this repo's tester apps switching
@@ -121,15 +177,31 @@ public final class Encatch: @unchecked Sendable {
             logger.debug("SDK already initialized — reconfiguring with new apiKey/config")
             let oldSessionManager = sessionManager
             let oldRetryFlushTask = retryFlushTask
+            rateLimiter?.clear()
             let teardown = Task {
                 await oldSessionManager?.stopPingIntervalAndWait()
                 await oldRetryFlushTask?.value
             }
             pendingReinitTask = teardown
             await teardown.value
+            // the old queue's items must not go out later with the new key (nor stay held forever)
+            await retryQueue?.clear()
             isSessionPaused = false
             isSessionStopped = false
-            isFormVisible = false
+            // another key or environment: no identify, expiry or collapse memory carries over
+            withStateLock {
+                signatureExpired = false
+                heldSubmits = []
+                lastIdentifyKey = nil
+                lastEventAtMs = [:]
+                lastScreen = nil
+            }
+            cancelPendingAutoShow()
+            withSurveyLock {
+                isFormVisible = false
+                openFormIds = []
+                loadingFormId = nil
+            }
         }
 
         apiKeyState = apiKey
@@ -141,25 +213,32 @@ public final class Encatch: @unchecked Sendable {
 
         logger.debug("Initializing SDK...")
 
-        let storage = EncatchStorage()
+        let defaults = storageDefaultsForTesting ?? .standard
+        let storage: EncatchStorage
+        if config?.persistUserAcrossRestarts ?? true {
+            memoryUserStore.clear()
+            storage = EncatchStorage(defaults: defaults)
+        } else {
+            // nothing about the user is kept on the device, including what an earlier run saved
+            storage = EncatchStorage(defaults: defaults, userMemory: memoryUserStore)
+            storage.deleteSavedUserData()
+        }
         self.storage = storage
+        let rateLimiter = RateLimiter(defaultPauseMs: timings.defaultPauseMs, maxPauseMs: timings.maxPauseMs, logger: logger)
+        self.rateLimiter = rateLimiter
         self.apiClient = EncatchApiClient(
+            transport: transportForTesting,
             baseUrlProvider: { [self] in apiBaseUrlState },
-            authStateProvider: { [self] in
-                AuthState(
-                    apiKey: apiKeyState,
-                    sessionId: sessionIdState,
-                    userName: userNameState,
-                    userId: userIdState,
-                    userSignature: userSignature,
-                    deviceId: deviceIdState,
-                    appPackageName: appPackageName
-                )
-            },
+            authStateProvider: { [self] in authState() },
             onUserPendingRetryExhausted: { [self] in
+                // the server gave up on creating this user: stop pinging, back to a visitor (RN 1.4.4 item 14)
+                logger.warn("User identification timed out (userPendingRetryExhausted): the user is reset")
                 sessionManager?.stopPingInterval()
                 try? await resetUser()
             },
+            onSignatureExpired: { [self] signature, user in onSignatureExpired(signature: signature, user: user) },
+            rateLimiter: rateLimiter,
+            requestTimeoutMs: timings.requestTimeoutMs,
             logger: logger,
             // Full request/response payloads (including the API key) only leave the SDK when
             // the host explicitly opted into debugMode — same gate as the debug logger.
@@ -168,11 +247,20 @@ public final class Encatch: @unchecked Sendable {
                 onNetworkLog?(entry)
             }
         )
-        self.retryQueue = RetryQueue(storage: storage)
+        let retryQueue = RetryQueue(storage: storage, rateLimiter: rateLimiter, backoffBaseMs: timings.retryBackoffBaseMs, logger: logger)
+        self.retryQueue = retryQueue
+        // what the queue held during a pause goes out once the pause ends
+        rateLimiter.onPauseEnd { bucket in
+            if bucket == RetryQueue.bucket { Task { await retryQueue.flush() } }
+        }
         self.sessionManager = SessionManager(
-            isFormVisible: { [self] in isFormVisible },
-            onPing: { [self] in try? await doPing() }
+            pingIntervalMs: timings.pingIntervalMs,
+            isFormVisible: { [self] in withSurveyLock { isFormVisible } },
+            onPing: { [self] in await backgroundPing() }
         )
+        // A stopSession() from a previous run stays in effect until startSession() or a successful
+        // identify (RN 1.4.4 item 19b).
+        isSessionStopped = storage.getSessionStopped()
 
         let storedName = storage.getUserName()
         deviceIdState = storage.getOrCreateDeviceId()
@@ -186,10 +274,26 @@ public final class Encatch: @unchecked Sendable {
         if let country = prefs.country { countryState = country }
 
         if let storedName {
-            userNameState = storedName
-            userIdState = storage.getUserId(userName: storedName)
+            // A name stored without its id (a first identify that failed) is a visitor until the
+            // next identify: the identity headers go out both or neither.
+            let storedId = storage.getUserId(userName: storedName)
+            let stored = storage.getUserSignature(userName: storedName)
+            withStateLock {
+                userNameState = storedName
+                userIdState = storedId
+                userSignature = stored?.signature
+                userSignatureTime = stored?.time
+                confirmedIdentity = storedId != nil
+            }
             feedbackTransactions = storage.getFeedbackTransactions(identityKey: storedName)
         } else {
+            withStateLock {
+                userNameState = nil
+                userIdState = nil
+                userSignature = nil
+                userSignatureTime = nil
+                confirmedIdentity = false
+            }
             feedbackTransactions = storage.getFeedbackTransactions(identityKey: "anonymous")
         }
 
@@ -207,8 +311,57 @@ public final class Encatch: @unchecked Sendable {
 
     public func identifyUser(userName: String, traits: UserTraits? = nil, options: IdentifyOptions? = nil) async throws {
         guard initialized else { return }
+        // Identity changes run one after the other, so a resetUser() fired just before (and not
+        // awaited) finishes first and can't undo this identify.
+        await identityOps.run { await self.identifyNow(userName: userName, traits: traits, options: options) }
+    }
 
-        userNameState = userName
+    private func identifyNow(userName: String, traits: UserTraits?, options: IdentifyOptions?) async {
+        guard initialized else { return }
+        let secure = options?.secure
+        // Skip a call identical to the last identify sent or still in flight (RN 1.4.4 item 3).
+        let identifyKey = canonicalJSONString(.object([
+            "userName": .string(userName),
+            "traits": traits?.toJSONValue() ?? .null,
+            "locale": options?.locale.map { .string($0) } ?? .null,
+            "country": options?.country.map { .string($0) } ?? .null,
+            "signature": secure.map { .string($0.signature) } ?? .null,
+            "signatureTime": secure?.generatedDateTimeInUtc.map { .string($0) } ?? .null,
+        ]))
+        let duplicate: Bool = withStateLock {
+            if lastIdentifyKey == identifyKey { return true }
+            lastIdentifyKey = identifyKey
+            return false
+        }
+        if duplicate {
+            logger.debug("identifyUser \"\(userName)\" skipped: same as the last identify (duplicate)")
+            return
+        }
+
+        // Switching user: take this user's stored id and signature (or none) together with the
+        // name, so a request never pairs this name with another user's. With no stored id,
+        // requests go as a visitor until the identify reply arrives.
+        let switching = withStateLock { userNameState != userName }
+        if switching {
+            // a queued identify of the previous user must not go out after this one
+            await retryQueue.removeQueued(label: "identifyUser")
+            let storedId = storage.getUserId(userName: userName)
+            let stored = storage.getUserSignature(userName: userName)
+            // the previous user's held submits and signature expiry don't carry over (as on reset)
+            let droppedSubmits: Int = withStateLock {
+                userNameState = userName
+                userIdState = storedId
+                userSignature = stored?.signature
+                userSignatureTime = stored?.time
+                signatureExpired = false
+                let dropped = heldSubmits.count
+                heldSubmits = []
+                return dropped
+            }
+            if droppedSubmits > 0 {
+                logger.warn("\(droppedSubmits) held survey submit(s) dropped: another user was identified")
+            }
+        }
         storage.setUserName(userName)
 
         if let locale = options?.locale {
@@ -225,43 +378,150 @@ public final class Encatch: @unchecked Sendable {
             "userName": .string(userName),
             "$deviceInfo": deviceInfo.toJSONValue(),
         ]
-        if let userIdState { req["userId"] = .string(userIdState) }
-        if let signature = options?.secure?.signature ?? userSignature { req["userSignature"] = .string(signature) }
+        // the id only when known for this name
+        if let userId = withStateLock({ userNameState == userName ? userIdState : nil }) { req["userId"] = .string(userId) }
+        if let secure { req["userSignature"] = .string(secure.signature) }
         if let traits { req["userAttributes"] = traits.toJSONValue() }
         if let feedbackTransactions { req["$feedbackTransactions"] = .string(feedbackTransactions) }
 
-        let signatureTime = options?.secure?.generatedDateTimeInUtc
         let requestBody = JSONValue.object(req)
+        // X-User-Name is this call's name, taken now — never the SDK's state when the queued request goes out
+        let requestOptions = RequestOptions(
+            identifyUserName: userName,
+            signature: secure?.signature,
+            signatureTime: secure?.generatedDateTimeInUtc
+        )
 
-        await retryQueue.enqueue(label: "identifyUser") {
-            let res = try await self.apiClient.post(endpoint: Endpoints.identifyUser, body: requestBody, signatureTime: signatureTime)
-            if case .object(let resObj) = res {
-                if case .string(let userId)? = resObj["userId"] {
-                    self.userIdState = userId
-                    self.storage.setUserId(userName: userName, userId: userId)
-                }
-                if case .string(let ft)? = resObj["$feedbackTransactions"] {
-                    self.feedbackTransactions = ft
-                    self.storage.setFeedbackTransactions(identityKey: userName, value: ft)
-                }
-            }
-            let meta = res.toResponseMeta()
-            self.sessionManager.handleResponseMeta(meta)
+        // While tracking is paused after a 429, hold only the latest identify: it goes out when the
+        // pause ends, so a sign-in during a pause isn't lost and repeated calls don't pile up.
+        if rateLimiter.isPaused(.tracking) { await retryQueue.removeQueued(label: "identifyUser") }
 
-            EncatchInternalEmitter.shared.emit(.userIdentified(userName: self.userNameState, userId: self.userIdState))
-
-            try? await self.startSession(StartSessionOptions(skipImmediatePing: true, skipImmediateTrackScreen: true))
-
-            if let pingAgainIn = meta.pingAgainIn, pingAgainIn > 0 {
-                self.sessionManager.scheduleNextPing(delayMs: Int64(pingAgainIn * 1000))
-            }
-
-            if case .object(let resObj) = res, case .string(let formConfigId)? = resObj["formConfigurationId"] {
-                await self.showFormById(formConfigId, triggerType: .automatic)
-            }
+        await retryQueue.enqueue(label: "identifyUser", onDrop: { [weak self] in
+            // dropped without succeeding: the same identify may be sent again
+            guard let self else { return }
+            self.withStateLock { if self.lastIdentifyKey == identifyKey { self.lastIdentifyKey = nil } }
+        }) {
+            let res = try await self.apiClient.post(endpoint: Endpoints.identifyUser, body: requestBody, options: requestOptions)
+            await self.applyIdentifyReply(res, userName: userName, secure: secure)
         }
 
         Task { await self.retryQueue.flush() }
+    }
+
+    private func applyIdentifyReply(_ res: JSONValue, userName: String, secure: SecureOptions?) async {
+        guard initialized else { return }
+        var replyUserId: String?
+        var replyFt: String?
+        if case .object(let resObj) = res {
+            if case .string(let value)? = resObj["userId"], !value.isEmpty { replyUserId = value }
+            if case .string(let value)? = resObj["$feedbackTransactions"] { replyFt = value }
+        }
+        // A reply for a user who is no longer current (reset, switched or cleared since): ignored,
+        // its id not stored either.
+        let current: Bool = withStateLock {
+            guard userNameState == userName else { return false }
+            if let replyUserId { userIdState = replyUserId }
+            // the identify succeeded: this user is now the confirmed identity
+            if userIdState != nil { confirmedIdentity = true }
+            // After a successful secure identify its signature (and time) go on every request of this
+            // user; an identify without `secure` clears them.
+            userSignature = secure?.signature
+            userSignatureTime = secure?.signature != nil ? secure?.generatedDateTimeInUtc : nil
+            return true
+        }
+        guard current else {
+            logger.debug("identify reply for \"\(userName)\" ignored: no longer the current user")
+            return
+        }
+        if let replyUserId { storage.setUserId(userName: userName, userId: replyUserId) }
+        if let secure {
+            storage.setUserSignature(userName: userName, value: .init(signature: secure.signature, time: secure.generatedDateTimeInUtc))
+        } else {
+            storage.clearUserSignature(userName: userName)
+        }
+        endSignatureExpired()
+        if let replyFt {
+            feedbackTransactions = replyFt
+            storage.setFeedbackTransactions(identityKey: userName, value: replyFt)
+        }
+        let meta = res.toResponseMeta()
+        sessionManager.handleResponseMeta(meta)
+
+        let identity = withStateLock { (userNameState, userIdState) }
+        EncatchInternalEmitter.shared.emit(.userIdentified(userName: identity.0, userId: identity.1))
+
+        try? await startSession(StartSessionOptions(skipImmediatePing: true, skipImmediateTrackScreen: true))
+
+        if let pingAgainIn = meta.pingAgainIn, pingAgainIn > 0 {
+            sessionManager.scheduleNextPing(delayMs: Int64(pingAgainIn * 1000))
+        }
+
+        await handleSurveyInReply(res)
+    }
+
+    /// The identity, signature and app state the next request is built from — one snapshot.
+    private func authState() -> AuthState {
+        withStateLock {
+            AuthState(
+                apiKey: apiKeyState,
+                sessionId: sessionIdState,
+                userName: userNameState,
+                userId: userIdState,
+                userSignature: userSignature,
+                userSignatureTime: userSignatureTime,
+                deviceId: deviceIdState,
+                appPackageName: appPackageName
+            )
+        }
+    }
+
+    /// The stored session-time signature expired (a 401 on a request that carried it): warn once,
+    /// drop it, and wait for the next successful identify. A late 401 for an older signature (or
+    /// another user) is ignored, so it can't undo a fresh secure identify.
+    private func onSignatureExpired(signature: String, user: String?) {
+        let (first, current): (Bool, String?) = withStateLock {
+            guard userSignature == signature, userNameState == user else { return (false, nil) }
+            if signatureExpired { return (false, nil) }
+            signatureExpired = true
+            userSignature = nil
+            userSignatureTime = nil
+            // the same signed identify may be sent again
+            lastIdentifyKey = nil
+            return (true, userNameState)
+        }
+        guard first else { return }
+        logger.warn(
+            "Secure identify signature expired (401). Call identifyUser() with a fresh signature; until then " +
+                "events, screens, ping and automatic surveys are skipped and survey submits are held."
+        )
+        if let current { storage?.clearUserSignature(userName: current) }
+    }
+
+    var isSignatureExpired: Bool { withStateLock { signatureExpired } }
+
+    /// A stopSession() is in effect (saved across restarts until startSession() or a successful identify).
+    var sessionStopped: Bool { isSessionStopped }
+    var pingActive: Bool { sessionManager?.isPingActive ?? false }
+    var sessionManagerForTesting: SessionManager { sessionManager }
+
+    /// Keeps a submit until the next successful identify (in memory, at most 10, oldest dropped).
+    private func holdSubmit(_ params: SubmitFormRequest) {
+        withStateLock {
+            heldSubmits.append(params)
+            if heldSubmits.count > Self.maxHeldSubmits { heldSubmits.removeFirst() }
+        }
+        logger.debug("submitForm held until the next identify (secure signature expired)")
+    }
+
+    /// A successful identify ends the expired state and sends any held submits.
+    private func endSignatureExpired() {
+        let held: [SubmitFormRequest] = withStateLock {
+            signatureExpired = false
+            let held = heldSubmits
+            heldSubmits = []
+            return held
+        }
+        for params in held { Task { try? await self.submitForm(params) } }
     }
 
     // ============================================================================
@@ -288,6 +548,28 @@ public final class Encatch: @unchecked Sendable {
 
     public func trackEvent(_ eventName: String) async throws {
         guard initialized, !isFullScreenState else { return }
+        // rate limited (429): new events are skipped until the pause ends
+        if rateLimiter.isPaused(.tracking) {
+            logger.debug("trackEvent \"\(eventName)\" skipped: rate limited")
+            return
+        }
+        if isSignatureExpired {
+            logger.debug("trackEvent \"\(eventName)\" skipped: secure signature expired, waiting for identify")
+            return
+        }
+        // the same event again within the collapse window is sent once
+        let window = timings.collapseWindowMs
+        let collapsed: Bool = withStateLock {
+            let now = monotonicNowMs()
+            if let last = lastEventAtMs[eventName], now - last < window { return true }
+            lastEventAtMs[eventName] = now
+            if lastEventAtMs.count > 200 { lastEventAtMs = lastEventAtMs.filter { now - $0.value < window } }
+            return false
+        }
+        if collapsed {
+            logger.debug("trackEvent \"\(eventName)\" collapsed (same event within \(window) ms)")
+            return
+        }
 
         let deviceInfo = buildDeviceInfo()
         var req: [String: JSONValue] = ["eventName": .string(eventName), "$deviceInfo": deviceInfo.toJSONValue()]
@@ -299,9 +581,7 @@ public final class Encatch: @unchecked Sendable {
             await self.applyFeedbackTransactions(res)
             let meta = res.toResponseMeta()
             self.sessionManager.handleResponseMeta(meta)
-            if case .object(let resObj) = res, case .string(let formConfigId)? = resObj["formConfigurationId"] {
-                await self.showFormById(formConfigId, triggerType: .automatic)
-            }
+            await self.handleSurveyInReply(res)
         }
 
         Task { await self.retryQueue.flush() }
@@ -312,6 +592,19 @@ public final class Encatch: @unchecked Sendable {
     /// mirroring how the RN SDK's `useEncatchFormWebView` hook calls `Encatch._trackFormEvent`.
     public func trackFormEvent(_ eventName: String, _ feedbackConfigurationId: String?) async {
         guard initialized else { return }
+        if rateLimiter.isPaused(.tracking) {
+            logger.debug("survey event \(eventName) skipped: rate limited")
+            return
+        }
+        if isSignatureExpired {
+            logger.debug("survey event \(eventName) skipped: secure signature expired")
+            return
+        }
+        // survey events are an identified user's: the server answers 403 to a visitor's (RN 1.4.4 item 8)
+        guard hasIdentity else {
+            logger.debug("survey event \(eventName) skipped: visitor")
+            return
+        }
         let deviceInfo = buildDeviceInfo()
         var req: [String: JSONValue] = ["eventName": .string(eventName), "$deviceInfo": deviceInfo.toJSONValue()]
         if let feedbackConfigurationId { req["feedbackConfigurationId"] = .string(feedbackConfigurationId) }
@@ -322,9 +615,7 @@ public final class Encatch: @unchecked Sendable {
             await applyFeedbackTransactions(res)
             let meta = res.toResponseMeta()
             sessionManager.handleResponseMeta(meta)
-            if case .object(let resObj) = res, case .string(let formConfigId)? = resObj["formConfigurationId"] {
-                await showFormById(formConfigId, triggerType: .automatic)
-            }
+            await handleSurveyInReply(res)
         } catch {
             // Best-effort; matches Kotlin's runCatching { }.
         }
@@ -334,6 +625,27 @@ public final class Encatch: @unchecked Sendable {
         guard initialized, !isFullScreenState else { return }
 
         currentScreen = screenName
+        // rate limited: the current screen is still remembered (it goes with the next ping)
+        if rateLimiter.isPaused(.tracking) {
+            logger.debug("trackScreen \"\(screenName)\" skipped: rate limited")
+            return
+        }
+        if isSignatureExpired {
+            logger.debug("trackScreen \"\(screenName)\" skipped: secure signature expired, waiting for identify")
+            return
+        }
+        // collapsed only when the screen hasn't changed since the last one tracked (A → B → A is sent in full)
+        let window = timings.collapseWindowMs
+        let collapsed: Bool = withStateLock {
+            let now = monotonicNowMs()
+            if let last = lastScreen, last.name == screenName, now - last.atMs < window { return true }
+            lastScreen = (screenName, now)
+            return false
+        }
+        if collapsed {
+            logger.debug("trackScreen \"\(screenName)\" collapsed (same screen within \(window) ms)")
+            return
+        }
         let deviceInfo = buildDeviceInfo(screenName: screenName)
         var req: [String: JSONValue] = ["$deviceInfo": deviceInfo.toJSONValue()]
         if let feedbackTransactions { req["$feedbackTransactions"] = .string(feedbackTransactions) }
@@ -344,20 +656,7 @@ public final class Encatch: @unchecked Sendable {
             await self.applyFeedbackTransactions(res)
             let meta = res.toResponseMeta()
             self.sessionManager.handleResponseMeta(meta)
-            guard case .object(let resObj) = res else { return }
-            if case .string(let formConfigId)? = resObj["formConfigurationId"] {
-                await self.showFormById(formConfigId, triggerType: .automatic)
-            }
-            if case .string(let nextId)? = resObj["nextFeedbackId"] {
-                // let, not var: Swift 5.10 rejects capturing a mutated var in the Task closure
-                // ("reference to captured var in concurrently-executing code").
-                let delaySeconds: Double
-                if case .number(let d)? = resObj["onPageDelay"] { delaySeconds = d } else { delaySeconds = 0.0 }
-                Task {
-                    try? await Task.sleep(nanoseconds: UInt64(max(0, delaySeconds * 1000)) * 1_000_000)
-                    await self.showFormById(nextId, triggerType: .automatic, reset: .always)
-                }
-            }
+            await self.handleSurveyInReply(res)
         }
 
         Task { await self.retryQueue.flush() }
@@ -372,11 +671,86 @@ public final class Encatch: @unchecked Sendable {
         await showFormInternal(formId: formId, resetMode: options?.reset ?? .always, triggerType: .manual, context: options?.context)
     }
 
-    private func showFormById(_ formConfigurationId: String, triggerType: TriggerType, reset: ResetMode = .always) async {
-        await showFormInternal(formId: formConfigurationId, resetMode: reset, triggerType: triggerType, context: nil)
+    /// A survey the server offers in a reply — identify, ping, track-event, track-screen and survey
+    /// events alike: `nextFeedbackId`, shown after `onPageDelay` seconds; without it,
+    /// `formConfigurationId` (older servers; none send it today) at once. Mirrors RN 1.4.4
+    /// `_handleSurveyInReply`; before this only track-screen replies were read (AN-001).
+    func handleSurveyInReply(_ res: JSONValue) async {
+        guard case .object(let resObj) = res else { return }
+        var next: String?
+        if case .string(let value)? = resObj["nextFeedbackId"], !value.isEmpty { next = value }
+        var legacy: String?
+        if case .string(let value)? = resObj["formConfigurationId"], !value.isEmpty { legacy = value }
+        guard let formId = next ?? legacy else { return }
+        var delayMs: Int64 = 0
+        if next != nil, case .number(let seconds)? = resObj["onPageDelay"] { delayMs = Int64(max(0, seconds * 1000)) }
+        scheduleAutoShow(formId: formId, delayMs: delayMs)
+    }
+
+    /// One pending automatic show at a time; none while a survey is pending, loading or open.
+    private func scheduleAutoShow(formId: String, delayMs: Int64) {
+        if isSignatureExpired {
+            logger.debug("survey \(formId) offered: skipped (secure signature expired)")
+            return
+        }
+        let scheduled: Bool = withSurveyLock {
+            if pendingAutoShow != nil || loadingFormId != nil || isFormVisible { return false }
+            let token = UUID()
+            pendingAutoShowToken = token
+            pendingAutoShow = Task { [weak self] in
+                if delayMs > 0 { try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000) }
+                guard let self, !Task.isCancelled else { return }
+                await self.showFormInternal(formId: formId, resetMode: .always, triggerType: .automatic, context: nil, scheduledBy: token)
+            }
+            return true
+        }
+        if !scheduled { logger.debug("survey \(formId) offered while another is pending or open: skipped (survey-open)") }
+    }
+
+    /// Cancels a survey waiting out its delay (stopSession, resetUser, clearAll, re-init).
+    private func cancelPendingAutoShow() {
+        withSurveyLock {
+            pendingAutoShow?.cancel()
+            pendingAutoShow = nil
+            pendingAutoShowToken = nil
+        }
     }
 
     private func showFormInternal(
+        formId: String,
+        resetMode: ResetMode,
+        triggerType: TriggerType,
+        context: [String: ContextValue]?,
+        scheduledBy token: UUID? = nil
+    ) async {
+        let expired = isSignatureExpired
+        let rateLimited = rateLimiter.isPaused(.showForm)
+        // nil: go ahead; otherwise why the show is skipped
+        let skipReason: String? = withSurveyLock {
+            // the scheduled show has started: it is now "loading", no longer "pending" — if it is still the current one
+            if let token {
+                guard pendingAutoShowToken == token else { return "superseded by a newer automatic show" }
+                pendingAutoShow = nil
+                pendingAutoShowToken = nil
+            }
+            if rateLimited { return "rate limited" }
+            if triggerType == .automatic && expired { return "secure signature expired" }
+            if triggerType == .automatic && (loadingFormId != nil || isFormVisible) { return "a survey is loading or open (survey-open)" }
+            if triggerType == .manual && (loadingFormId == formId || (isFormVisible && openFormIds.contains(formId))) {
+                return "that survey is already loading or open"
+            }
+            loadingFormId = formId
+            return nil
+        }
+        if let skipReason {
+            logger.debug("show-form \(formId) skipped: \(skipReason)")
+            return
+        }
+        await showFormRequest(formId: formId, resetMode: resetMode, triggerType: triggerType, context: context)
+        withSurveyLock { if loadingFormId == formId { loadingFormId = nil } }
+    }
+
+    private func showFormRequest(
         formId: String,
         resetMode: ResetMode,
         triggerType: TriggerType,
@@ -437,6 +811,13 @@ public final class Encatch: @unchecked Sendable {
                 inlineSlotId = nil
             }
 
+            // open before the UI hears of it: the host runs inside emit, and may report at once that
+            // it could not show it (no window) — that report must find the survey already marked open
+            withSurveyLock {
+                isFormVisible = true
+                openFormIds = Set([formId, feedbackConfigurationId].compactMap { $0 }.filter { !$0.isEmpty })
+            }
+
             EncatchInternalEmitter.shared.emit(.showForm(ShowFormPayload(
                 formId: formId,
                 formConfig: resObj.toShowFormResponse(),
@@ -450,10 +831,42 @@ public final class Encatch: @unchecked Sendable {
                 inlineSlotId: inlineSlotId
             )))
 
-            isFormVisible = true
         } catch {
-            logger.warn("showForm API error: \((error as? EncatchApiException)?.message ?? "\(error)")")
+            // 404: "not eligible now" (the server has no "already shown") — expected, no retry
+            if let apiError = error as? EncatchApiException, apiError.status == 404 {
+                logger.debug("show-form \(formId): not eligible now (404)")
+            } else {
+                logger.warn("showForm API error: \((error as? EncatchApiException)?.message ?? "\(error)")")
+            }
         }
+    }
+
+    /// Both identity headers go out: a user name and the id the server gave it.
+    var hasIdentity: Bool { withStateLock { userNameState != nil && userIdState != nil } }
+
+    /// A survey the user closed before its final submit (the page's ✕, a tap outside it): the
+    /// `form:dismissed` survey event (identified users) and `dismiss-form` with the form's UUID from
+    /// the show-form reply — for visitors too, as the web SDK and Flutter 1.2.0 do, so a survey that
+    /// stops on "Dismissed" is not offered again. The UI closes itself.
+    func recordDismissal(_ formConfigurationId: String?) async {
+        guard initialized else { return }
+        let id = (formConfigurationId?.isEmpty == false) ? formConfigurationId : nil
+        Task { await self.trackFormEvent("form:dismissed", id) }
+        if let id {
+            var req: [String: JSONValue] = ["formConfigurationId": .string(id), "$deviceInfo": buildDeviceInfo().toJSONValue()]
+            if let feedbackTransactions { req["$feedbackTransactions"] = .string(feedbackTransactions) }
+            do {
+                let res = try await apiClient.post(endpoint: Endpoints.dismissForm, body: .object(req))
+                await applyFeedbackTransactions(res)
+                sessionManager.handleResponseMeta(res.toResponseMeta())
+            } catch {
+                logger.warn("dismissForm API error: \((error as? EncatchApiException)?.message ?? "\(error)")")
+            }
+        } else {
+            // dismiss-form needs the form's UUID (400 otherwise)
+            logger.warn("survey closed without a form id: no dismiss-form sent")
+        }
+        emitEvent(.formDismissed, EventPayload(formId: id ?? "", timestamp: currentTimeMillis()))
     }
 
     public func dismissForm(_ formConfigurationId: String? = nil) async throws {
@@ -461,7 +874,10 @@ public final class Encatch: @unchecked Sendable {
 
         pendingCtaScheduler?.cancel(formId: formConfigurationId)
         EncatchInternalEmitter.shared.emit(.dismissForm(formConfigurationId: formConfigurationId))
-        isFormVisible = false
+        withSurveyLock {
+            isFormVisible = false
+            openFormIds = []
+        }
 
         Task { await self.trackFormEvent("form:dismissed", formConfigurationId) }
 
@@ -512,19 +928,41 @@ public final class Encatch: @unchecked Sendable {
 
     public func submitForm(_ params: SubmitFormRequest) async throws {
         guard initialized else { return }
+        // Secure signature expired: hold the answers until the app identifies again.
+        if isSignatureExpired {
+            holdSubmit(params)
+            return
+        }
         let deviceInfo = buildDeviceInfo()
         var req: [String: JSONValue] = ["$deviceInfo": deviceInfo.toJSONValue()]
         if let triggerType = params.triggerType { req["triggerType"] = .string(triggerType) }
         req["formDetails"] = params.formDetails.toJSONValue() ?? .null
 
-        do {
-            let res = try await apiClient.post(endpoint: Endpoints.submitForm, body: .object(req))
-            await applyFeedbackTransactions(res)
-            sessionManager.handleResponseMeta(res.toResponseMeta())
-        } catch {
-            logger.warn("submitForm API error: \((error as? EncatchApiException)?.message ?? "\(error)")")
+        // A submit carries the user's answers, so it is never dropped for a 429: it waits for the
+        // pause to end and is retried, up to 3 attempts in all. Kept in memory only.
+        for attempt in 1...Self.submitMaxAttempts {
+            let wait = rateLimiter.remainingMs(.submitForm)
+            if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(wait) * 1_000_000) }
+            do {
+                let res = try await apiClient.post(endpoint: Endpoints.submitForm, body: .object(req))
+                await applyFeedbackTransactions(res)
+                sessionManager.handleResponseMeta(res.toResponseMeta())
+                return
+            } catch {
+                let status = (error as? EncatchApiException)?.status
+                if status == 429 && attempt < Self.submitMaxAttempts { continue }
+                if status == 401, isSignatureExpired {
+                    holdSubmit(params)
+                    return
+                }
+                logger.warn("submitForm API error: \((error as? EncatchApiException)?.message ?? "\(error)")")
+                return
+            }
         }
     }
+
+    /// submit-form attempts in all when the API answers 429.
+    static let submitMaxAttempts = 3
 
     // ============================================================================
     // Refine text / Q&A with AI / upload
@@ -611,17 +1049,33 @@ public final class Encatch: @unchecked Sendable {
 
     public func clearAll() async throws {
         sessionManager?.stopPingInterval()
+        cancelPendingAutoShow()
 
         EncatchInternalEmitter.shared.emit(.dismissForm(formConfigurationId: nil))
-        isFormVisible = false
+        withSurveyLock {
+            isFormVisible = false
+            openFormIds = []
+            loadingFormId = nil
+        }
 
         storage?.clearAll()
+        await retryQueue?.clear()
+        rateLimiter?.clear()
 
         initialized = false
         apiKeyState = nil
-        userNameState = nil
-        userIdState = nil
-        userSignature = nil
+        withStateLock {
+            confirmedIdentity = false
+            userNameState = nil
+            userIdState = nil
+            userSignature = nil
+            userSignatureTime = nil
+            signatureExpired = false
+            heldSubmits = []
+            lastIdentifyKey = nil
+            lastEventAtMs = [:]
+            lastScreen = nil
+        }
         feedbackTransactions = nil
         deviceIdState = nil
         sessionIdState = nil
@@ -671,6 +1125,8 @@ public final class Encatch: @unchecked Sendable {
     public func resumeSession() {
         guard isSessionPaused else { return }
         isSessionPaused = false
+        // a stopSession() stays in effect until startSession() or a successful identify
+        guard !isSessionStopped else { return }
         sessionManager.startPingInterval()
     }
 
@@ -679,25 +1135,53 @@ public final class Encatch: @unchecked Sendable {
         isSessionStopped = true
         isSessionPaused = false
         sessionManager?.stopPingInterval()
+        cancelPendingAutoShow()
         EncatchInternalEmitter.shared.emit(.dismissForm(formConfigurationId: nil))
-        isFormVisible = false
+        withSurveyLock {
+            isFormVisible = false
+            openFormIds = []
+        }
         storage?.setSessionStopped()
     }
 
     public func resetUser() async throws {
         guard initialized else { throw EncatchNotInitializedException() }
-        if let name = userNameState {
-            storage.clearUserId(userName: name)
-            storage.clearFeedbackTransactions(identityKey: name)
+        await identityOps.run { await self.resetNow() }
+    }
+
+    private func resetNow() async {
+        guard initialized else { return }
+        // a queued (not yet sent) identify must not bring the user back
+        await retryQueue.removeQueued(label: "identifyUser")
+        // Clear the in-memory identity first, so nothing is sent with a half-cleared one.
+        let (previous, droppedSubmits): (String?, Int) = withStateLock {
+            let previous = userNameState
+            let dropped = heldSubmits.count
+            confirmedIdentity = false
+            userNameState = nil
+            userIdState = nil
+            userSignature = nil
+            userSignatureTime = nil
+            signatureExpired = false
+            heldSubmits = []
+            lastIdentifyKey = nil
+            lastEventAtMs = [:]
+            lastScreen = nil
+            return (previous, dropped)
+        }
+        if droppedSubmits > 0 {
+            logger.warn("\(droppedSubmits) held survey submit(s) dropped: the user was reset")
+        }
+        if let previous {
+            storage.clearUserId(userName: previous)
+            storage.clearFeedbackTransactions(identityKey: previous)
+            storage.clearUserSignature(userName: previous)
         }
         storage.clearFeedbackTransactions(identityKey: "anonymous")
         storage.clearUserName()
         storage.clearSession()
         storage.clearPreferences()
 
-        userNameState = nil
-        userIdState = nil
-        userSignature = nil
         feedbackTransactions = nil
         localeState = nil
         countryState = nil
@@ -705,13 +1189,28 @@ public final class Encatch: @unchecked Sendable {
 
         isSessionPaused = false
         isSessionStopped = false
+        storage.clearSessionStopped()
         sessionManager?.stopPingInterval()
+        cancelPendingAutoShow()
 
         EncatchInternalEmitter.shared.emit(.userIdentified(userName: nil, userId: nil))
     }
 
     public func setFormVisible(_ visible: Bool) {
-        isFormVisible = visible
+        setFormVisible(visible, formId: nil)
+    }
+
+    /// The UI says a survey opened or closed. `formId`: the survey it is about (the id it was shown
+    /// by) — a close of a survey since replaced by another is ignored, so the one on screen stays
+    /// "open" for the one-at-a-time guard.
+    public func setFormVisible(_ visible: Bool, formId: String?) {
+        let ignored: Bool = withSurveyLock {
+            if !visible, let formId, !openFormIds.isEmpty, !openFormIds.contains(formId) { return true }
+            isFormVisible = visible
+            if !visible { openFormIds = [] }
+            return false
+        }
+        if ignored { logger.debug("close of \(formId ?? "") ignored: another survey is open") }
     }
 
     /// Flushes the offline retry queue. The RN SDK does this automatically on `AppState` foreground;
@@ -748,22 +1247,38 @@ public final class Encatch: @unchecked Sendable {
     // Ping
     // ============================================================================
 
+    /// The ping of the interval and of a server-scheduled ping: none while stopped or paused
+    /// (doPing itself skips it during a 429 pause or after signature expiry).
+    private func backgroundPing() async {
+        if isSessionStopped || isSessionPaused {
+            logger.debug("ping skipped: session \(isSessionStopped ? "stopped" : "paused")")
+            return
+        }
+        try? await doPing()
+    }
+
     private func doPing() async throws {
+        if rateLimiter.isPaused(.tracking) {
+            logger.debug("ping skipped: rate limited")
+            return
+        }
+        if isSignatureExpired {
+            logger.debug("ping skipped: secure signature expired")
+            return
+        }
         let deviceInfo = buildDeviceInfo(screenName: currentScreen)
         var req: [String: JSONValue] = ["$deviceInfo": deviceInfo.toJSONValue()]
         if let feedbackTransactions { req["$feedbackTransactions"] = .string(feedbackTransactions) }
         let res = try await apiClient.post(endpoint: Endpoints.ping, body: .object(req))
         await applyFeedbackTransactions(res)
         sessionManager.handleResponseMeta(res.toResponseMeta())
-        if case .object(let resObj) = res, case .string(let formConfigId)? = resObj["formConfigurationId"] {
-            await showFormById(formConfigId, triggerType: .automatic)
-        }
+        await handleSurveyInReply(res)
     }
 
     private func applyFeedbackTransactions(_ res: JSONValue) async {
         guard case .object(let resObj) = res, case .string(let value)? = resObj["$feedbackTransactions"] else { return }
         feedbackTransactions = value
-        storage.setFeedbackTransactions(identityKey: userNameState ?? "anonymous", value: value)
+        storage.setFeedbackTransactions(identityKey: userName ?? "anonymous", value: value)
     }
 
     // ============================================================================
@@ -803,8 +1318,22 @@ public final class Encatch: @unchecked Sendable {
     public var locale: String? { localeState }
     public var deviceId: String? { deviceIdState }
     public var sessionId: String? { sessionIdState }
-    public var userName: String? { userNameState }
-    public var userId: String? { userIdState }
+    public var userName: String? { withStateLock { userNameState } }
+    public var userId: String? { withStateLock { userIdState } }
+
+    /// Whether the SDK has a confirmed identity (RN 1.5.0 item 2): `true` once an identify
+    /// succeeded, or at launch when a user saved by an earlier run is restored with their user id.
+    ///
+    /// - `false` before `init`, for a visitor, and while a first identify is pending or after it failed.
+    /// - Switching from one user to another keeps describing the previous user until the new user's
+    ///   identify succeeds (requests already go out as a visitor during the switch).
+    /// - `false` after `resetUser()` (also the server's "retries exhausted" reset) and `clearAll()`;
+    ///   `stopSession()` and an expired secure signature leave it unchanged.
+    /// - With `EncatchConfig.persistUserAcrossRestarts` off it is `false` at every launch until the
+    ///   app identifies.
+    public func isIdentified() -> Bool {
+        initialized && withStateLock { confirmedIdentity }
+    }
     public var debugMode: Bool { debugModeState }
 }
 
@@ -905,4 +1434,34 @@ extension Dictionary where Key == String, Value == JSONValue {
             feedbackTransactions: feedbackTransactions
         )
     }
+}
+
+/// Runs async operations one after the other, in call order (identifyUser / resetUser).
+final class SerialOps: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tail: Task<Void, Never>?
+
+    func run(_ op: @escaping @Sendable () async -> Void) async {
+        await enqueue(op).value
+    }
+
+    private func enqueue(_ op: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
+        lock.lock()
+        defer { lock.unlock() }
+        let previous = tail
+        let task = Task {
+            await previous?.value
+            await op()
+        }
+        tail = task
+        return task
+    }
+}
+
+/// JSON with object keys sorted, so equal values give equal strings (identify dedupe key).
+func canonicalJSONString(_ value: JSONValue) -> String {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    guard let data = try? encoder.encode(value), let string = String(data: data, encoding: .utf8) else { return "" }
+    return string
 }

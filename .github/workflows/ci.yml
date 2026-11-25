@@ -13,7 +13,7 @@ on:
 jobs:
   macos:
     name: swift build & test (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Swift version
@@ -25,7 +25,7 @@ jobs:
 
   ios:
     name: xcodebuild (iOS Simulator)
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Build for iOS Simulator
@@ -51,7 +51,12 @@ jobs:
       - name: Create release for tag
         env:
           GH_TOKEN: ${{ github.token }}
+        # A pre-release tag (X.Y.Z-label, e.g. 0.2.0-beta.1) becomes a GitHub pre-release and never
+        # "Latest", which stays the newest stable version.
         run: |
+          flags=()
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then flags=(--prerelease --latest=false); fi
           gh release create "${GITHUB_REF_NAME}" \
             --title "${GITHUB_REF_NAME}" \
-            --generate-notes
+            --generate-notes \
+            "${flags[@]}"
